@@ -95,11 +95,15 @@ struct rx888_dev {
     unsigned char **xfer_buf;
     rx888_read_async_cb_t cb;
     void *cb_ctx;
-    enum rx888_async_status async_status;
+    /* async_status and dev_lost are written by the streaming/callback thread
+     * and polled by rx888_close() on another thread. volatile is not a memory
+     * barrier, but it does stop the compiler from hoisting the load out of the
+     * polling loops, which would spin forever at -O2. */
+    volatile enum rx888_async_status async_status;
     int async_cancel;
     uint32_t sample_rate;
     /* status */
-    int dev_lost;
+    volatile int dev_lost;
     int driver_active;
     unsigned int xfer_errors;
     uint32_t gpio_state;
@@ -118,7 +122,10 @@ static rx888_t known_devices[] = {
 
 #define DEFAULT_BUF_NUMBER	16
 #define DEFAULT_BUF_LENGTH  (1024 * 16 * 8)
-#define CTRL_TIMEOUT 0
+/* control transfers must not block forever: a wedged or unplugged device would
+ * otherwise hang the caller inside libusb with no way out */
+#define CTRL_TIMEOUT 1000   /* ms */
+#define BULK_TIMEOUT 5000   /* ms, synchronous reads only */
 
 /* FX3 in bootloader mode (firmware not yet loaded into its volatile RAM) */
 #define FX3_BOOTLOADER_VID 0x04b4
@@ -180,8 +187,12 @@ static int fx3_ram_download(libusb_device_handle *h,
             return 0;
         }
 
+        if (dwLen > (UINT32_MAX / 4)) {
+            fprintf(stderr, "FX3 firmware: implausible section length\n");
+            return -1;
+        }
         uint32_t nbytes = dwLen * 4;
-        if (pos + nbytes > len) {
+        if (nbytes > len - pos) {   /* pos <= len here, so this cannot wrap */
             fprintf(stderr, "FX3 firmware: section overruns image\n");
             return -1;
         }
@@ -214,6 +225,11 @@ int rx888_load_firmware(void)
 
     libusb_device **list;
     ssize_t cnt = libusb_get_device_list(ctx, &list);
+    if (cnt < 0) {
+        /* list is untouched on error -- must not be freed */
+        libusb_exit(ctx);
+        return (int)cnt;
+    }
     int flashed = 0;
 
     for (ssize_t i = 0; i < cnt; i++) {
@@ -401,11 +417,17 @@ uint32_t rx888_get_device_count(void)
 
     libusb_device **list;
     ssize_t cnt = libusb_get_device_list(ctx, &list);
+    if (cnt < 0) {
+        /* list is untouched on error -- must not be freed */
+        libusb_exit(ctx);
+        return 0;
+    }
 
     uint32_t device_count = 0;
     struct libusb_device_descriptor dd;
-    for (int i = 0; i < cnt; i++) {
-        libusb_get_device_descriptor(list[i], &dd);
+    for (ssize_t i = 0; i < cnt; i++) {
+        if (libusb_get_device_descriptor(list[i], &dd) < 0)
+            continue;
 
         if (find_known_device(dd.idVendor, dd.idProduct))
             device_count++;
@@ -427,20 +449,32 @@ const char *rx888_get_device_name(uint32_t index)
 
     libusb_device **list;
     ssize_t cnt = libusb_get_device_list(ctx, &list);
+    if (cnt < 0) {
+        /* list is untouched on error -- must not be freed */
+        libusb_exit(ctx);
+        return "";
+    }
 
     struct libusb_device_descriptor dd;
     uint32_t device_count = 0;
     rx888_t *device = NULL;
-    for (int i = 0; i < cnt; i++) {
-        libusb_get_device_descriptor(list[i], &dd);
+    /* found stays NULL unless the requested index is actually reached: device
+     * alone would still hold the last probed entry after the loop falls
+     * through, and an out-of-range index would report that device's name */
+    rx888_t *found = NULL;
+    for (ssize_t i = 0; i < cnt; i++) {
+        if (libusb_get_device_descriptor(list[i], &dd) < 0)
+            continue;
 
         device = find_known_device(dd.idVendor, dd.idProduct);
 
         if (device) {
             device_count++;
 
-            if (index == device_count - 1)
+            if (index == device_count - 1) {
+                found = device;
                 break;
+            }
         }
     }
 
@@ -448,8 +482,8 @@ const char *rx888_get_device_name(uint32_t index)
 
     libusb_exit(ctx);
 
-    if (device)
-        return device->name;
+    if (found)
+        return found->name;
     else
         return "";
 }
@@ -464,13 +498,22 @@ int rx888_get_device_usb_strings(uint32_t index, char *manufact,
 
     libusb_device **list;
     ssize_t cnt = libusb_get_device_list(ctx, &list);
+    if (cnt < 0) {
+        /* list is untouched on error -- must not be freed */
+        libusb_exit(ctx);
+        return (int)cnt;
+    }
 
     uint32_t device_count = 0;
     rx888_dev_t devt;
     rx888_t *device = NULL;
     struct libusb_device_descriptor dd;
-    for (int i = 0; i < cnt; i++) {
-        libusb_get_device_descriptor(list[i], &dd);
+    /* r is still 0 from libusb_init: report a miss rather than success with
+     * the caller's buffers left untouched */
+    r = -1;
+    for (ssize_t i = 0; i < cnt; i++) {
+        if (libusb_get_device_descriptor(list[i], &dd) < 0)
+            continue;
 
         device = find_known_device(dd.idVendor, dd.idProduct);
 
@@ -511,6 +554,7 @@ int rx888_get_index_by_serial(const char *serial)
     int r;
     char str[256];
     for (int i = 0; i < cnt; i++) {
+        memset(str, 0, sizeof(str));
         r = rx888_get_device_usb_strings(i, NULL, NULL, str);
         if (!r && !strcmp(serial, str))
             return i;
@@ -533,6 +577,12 @@ int rx888_open(rx888_dev_t **out_dev, uint32_t index)
 
     libusb_device **list;
     ssize_t num_of_devs = libusb_get_device_list(dev->ctx, &list);
+    if (num_of_devs < 0) {
+        fprintf(stderr, "libusb_get_device_list error %s\n",
+                libusb_error_name((int)num_of_devs));
+        r = -1;
+        goto err;
+    }
 
     libusb_device *device = NULL;
     struct libusb_device_descriptor dev_desc;
@@ -553,6 +603,7 @@ int rx888_open(rx888_dev_t **out_dev, uint32_t index)
     }
 
     if(!device) {
+        libusb_free_device_list(list, 1);
         r = -1;
         goto err;
     }
@@ -596,7 +647,11 @@ int rx888_open(rx888_dev_t **out_dev, uint32_t index)
 
     dev->dev_lost = false;
 
-    dev->gpio_state = BIAS_HF;
+    /* NOTE: gpio_state is tracked but never pushed to the device -- no GPIOFX3
+     * command is ever sent, so the FX3 keeps its power-on pin defaults. Do not
+     * "fix" this by seeding it with BIAS_HF and transmitting: that would switch
+     * the HF bias tee on and put DC on the antenna port. */
+    dev->gpio_state = 0;
     *out_dev = dev;
     rx888_send_command(dev->dev_handle, R820T2STDBY, 0);
     rx888_send_command(dev->dev_handle, STOPFX3, 0);
@@ -667,11 +722,11 @@ int rx888_close(rx888_dev_t *dev)
 
 int rx888_read_sync(rx888_dev_t *dev, void *buf, int len, int *n_read)
 {
-    if (!dev)
+    if (!dev || !dev->dev_handle)
         return -1;
 
     return libusb_bulk_transfer(dev->dev_handle, 0x81,
-             buf, len, n_read, 0);
+             buf, len, n_read, BULK_TIMEOUT);
 }
 
 static void LIBUSB_CALL _libusb_callback(struct libusb_transfer *xfer)
@@ -710,24 +765,31 @@ static int _rx888_alloc_async_buffers(rx888_dev_t *dev)
         return -1;
 
     if (!dev->xfer) {
-        dev->xfer = malloc(dev->xfer_buf_num *
+        dev->xfer = calloc(dev->xfer_buf_num,
                    sizeof(struct libusb_transfer *));
+        if (!dev->xfer)
+            return -ENOMEM;
 
-        for(i = 0; i < dev->xfer_buf_num; ++i)
+        for(i = 0; i < dev->xfer_buf_num; ++i) {
             dev->xfer[i] = libusb_alloc_transfer(0);
+            if (!dev->xfer[i])
+                return -ENOMEM;
+        }
     }
 
     if (dev->xfer_buf)
         return -2;
 
     dev->xfer_buf = calloc(dev->xfer_buf_num, sizeof(unsigned char *));
-    
+    if (!dev->xfer_buf)
+        return -ENOMEM;
+
     for (i = 0; i < dev->xfer_buf_num; ++i) {
         dev->xfer_buf[i] = malloc(dev->xfer_buf_len);
         if (!dev->xfer_buf[i])
             return -ENOMEM;
     }
-    
+
 
     return 0;
 }
@@ -795,7 +857,13 @@ int rx888_read_async(rx888_dev_t *dev, rx888_read_async_cb_t cb, void *ctx,
     else
         dev->xfer_buf_len = DEFAULT_BUF_LENGTH;
 
-    _rx888_alloc_async_buffers(dev);
+    r = _rx888_alloc_async_buffers(dev);
+    if (r < 0) {
+        fprintf(stderr, "Failed to allocate async buffers: %d\n", r);
+        _rx888_free_async_buffers(dev);
+        dev->async_status = RX888_INACTIVE;
+        return r;
+    }
 
     for(uint32_t i = 0; i < dev->xfer_buf_num; ++i) {
         libusb_fill_bulk_transfer(dev->xfer[i],
